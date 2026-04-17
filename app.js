@@ -113,6 +113,27 @@ function registerCustomPlaneFromFrame(frame) {
   return id;
 }
 
+function findMatchingCustomPlaneId(frame, {
+  originEps = 1e-4,
+  axisDotEps = 1e-4,
+} = {}) {
+  const ez = frame.ez.clone().normalize();
+  const ex = frame.ex.clone().normalize();
+  const ey = frame.ey.clone().normalize();
+  for (const [id, plane] of Object.entries(state.customPlanes)) {
+    const pOrigin = vecFromArray(plane.origin);
+    const pEx = vecFromArray(plane.ex).normalize();
+    const pEy = vecFromArray(plane.ey).normalize();
+    const pEz = vecFromArray(plane.ez).normalize();
+    if (pOrigin.distanceTo(frame.origin) > originEps) continue;
+    if (Math.abs(pEz.dot(ez) - 1) > axisDotEps) continue;
+    if (Math.abs(pEx.dot(ex) - 1) > axisDotEps) continue;
+    if (Math.abs(pEy.dot(ey) - 1) > axisDotEps) continue;
+    return id;
+  }
+  return null;
+}
+
 // ─── Three.js Setup ──────────────────────────────────────────────────
 const canvas = document.getElementById('viewport');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -640,6 +661,37 @@ function buildCombinedExtrusionMesh(regions, depth) {
   return merged;
 }
 
+function pickBestCutResult({
+  solidVolume,
+  overlapVolume,
+  primaryMesh,
+  fallbackMesh,
+}) {
+  const primaryVolume = meshVolume(primaryMesh?.geometry);
+  const fallbackVolume = meshVolume(fallbackMesh?.geometry);
+  const eps = 1e-6;
+  const fullContainmentLikely = solidVolume > eps && overlapVolume >= solidVolume * 0.98;
+  const expectRemoval = overlapVolume > eps;
+
+  const isPlausible = (v) => {
+    if (!Number.isFinite(v)) return false;
+    if (!expectRemoval) return true;
+    if (fullContainmentLikely) return v <= solidVolume + eps;
+    return v > eps && v < solidVolume - Math.max(solidVolume * 1e-4, 1e-5);
+  };
+
+  const primaryOk = isPlausible(primaryVolume);
+  const fallbackOk = isPlausible(fallbackVolume);
+
+  if (fallbackOk && (!primaryOk || fallbackVolume > eps)) {
+    return { mesh: fallbackMesh, volume: fallbackVolume, valid: true };
+  }
+  if (primaryOk) {
+    return { mesh: primaryMesh, volume: primaryVolume, valid: true };
+  }
+  return { mesh: null, volume: 0, valid: false };
+}
+
 function clearExtrusionSelectionState() {
   clearRegionPreviews();
   state.regionCandidates = [];
@@ -749,8 +801,15 @@ function extrudeSelectedRegions(mode = 'fill') {
     }
 
     extrusionMesh.updateMatrixWorld(true);
+    const preparedCutter = prepareMeshForCSG(extrusionMesh);
+    const preparedCutterFlipped = prepareMeshForCSG(extrusionMesh, { flipWinding: true });
+    if (!preparedCutter) {
+      setStatus('Extrude (Cut): could not prepare cutter geometry.');
+      return;
+    }
     let modifiedCount = 0;
     let removedCount = 0;
+    let skippedUnstableCount = 0;
     const updatedSolids = [];
     for (const solid of state.solids) {
       const solidMesh = getSolidMeshById(solid.id);
@@ -760,8 +819,7 @@ function extrudeSelectedRegions(mode = 'fill') {
       }
       solidMesh.updateMatrixWorld(true);
       const preparedSolid = prepareMeshForCSG(solidMesh);
-      const preparedCutter = prepareMeshForCSG(extrusionMesh);
-      if (!preparedSolid || !preparedCutter) {
+      if (!preparedSolid) {
         updatedSolids.push(solid);
         continue;
       }
@@ -773,10 +831,37 @@ function extrudeSelectedRegions(mode = 'fill') {
         continue;
       }
 
-      const cutMesh = CSG.subtract(preparedSolid, preparedCutter);
-      const cutVolume = meshVolume(cutMesh?.geometry);
+      let cutMeshPrimary = null;
+      let cutMeshFallback = null;
+      try {
+        cutMeshPrimary = CSG.subtract(preparedSolid, preparedCutter);
+      } catch {
+        cutMeshPrimary = null;
+      }
+      if (preparedCutterFlipped) {
+        try {
+          cutMeshFallback = CSG.subtract(preparedSolid, preparedCutterFlipped);
+        } catch {
+          cutMeshFallback = null;
+        }
+      }
+
+      const solidVolume = meshVolume(preparedSolid.geometry);
+      const selectedCut = pickBestCutResult({
+        solidVolume,
+        overlapVolume,
+        primaryMesh: cutMeshPrimary,
+        fallbackMesh: cutMeshFallback,
+      });
+
+      if (!selectedCut.valid || !selectedCut.mesh?.geometry) {
+        skippedUnstableCount++;
+        updatedSolids.push(solid);
+        continue;
+      }
+
       modifiedCount++;
-      if (!cutMesh?.geometry || cutVolume <= 1e-6) {
+      if (selectedCut.volume <= 1e-6) {
         removedCount++;
         continue;
       }
@@ -784,7 +869,7 @@ function extrudeSelectedRegions(mode = 'fill') {
       updatedSolids.push({
         ...solid,
         color: SOLID_COLOR,
-        geometryData: geometryToData(cutMesh.geometry),
+        geometryData: geometryToData(selectedCut.mesh.geometry),
       });
     }
 
@@ -799,7 +884,8 @@ function extrudeSelectedRegions(mode = 'fill') {
     if (modifiedCount === 0) {
       setStatus('Extrude (Cut): no intersecting solids were found.');
     } else {
-      setStatus(`Extrude (Cut): modified ${modifiedCount} solid${modifiedCount === 1 ? '' : 's'}${removedCount ? `, removed ${removedCount}` : ''}.`);
+      const unstableMsg = skippedUnstableCount ? `, skipped ${skippedUnstableCount} unstable cut${skippedUnstableCount === 1 ? '' : 's'}` : '';
+      setStatus(`Extrude (Cut): modified ${modifiedCount} solid${modifiedCount === 1 ? '' : 's'}${removedCount ? `, removed ${removedCount}` : ''}${unstableMsg}.`);
     }
   }
 
@@ -1046,19 +1132,18 @@ function buildPlaneFrameFromIntersection(intersection) {
   const ez = intersection.face.normal.clone().applyMatrix3(normalMatrix).normalize();
   if (ez.lengthSq() < 1e-8) return null;
 
-  const edge = b.clone().sub(a);
-  edge.addScaledVector(ez, -edge.dot(ez));
-  if (edge.lengthSq() < 1e-8) {
-    edge.copy(c.clone().sub(a));
-    edge.addScaledVector(ez, -edge.dot(ez));
-  }
-  if (edge.lengthSq() < 1e-8) return null;
-
-  const ex = edge.normalize();
+  // Build a stable in-plane basis independent of triangle edge ordering.
+  const ref = Math.abs(ez.z) < 0.9
+    ? new THREE.Vector3(0, 0, 1)
+    : new THREE.Vector3(0, 1, 0);
+  const ex = new THREE.Vector3().crossVectors(ref, ez).normalize();
   const ey = new THREE.Vector3().crossVectors(ez, ex).normalize();
-  const correctedEx = new THREE.Vector3().crossVectors(ey, ez).normalize();
-  const origin = a.clone().add(b).add(c).multiplyScalar(1 / 3);
-  return { origin, ex: correctedEx, ey, ez };
+
+  // Use canonical plane origin (projection of world origin onto the plane)
+  // so repeated picks on the same planar face resolve to the same frame.
+  const d = ez.dot(a);
+  const origin = ez.clone().multiplyScalar(d);
+  return { origin, ex, ey, ez };
 }
 
 function enterFaceSketchPlane() {
@@ -1067,7 +1152,8 @@ function enterFaceSketchPlane() {
     return false;
   }
   if (!state.selectedFace.workPlaneId || !resolvePlaneFrame(state.selectedFace.workPlaneId)) {
-    state.selectedFace.workPlaneId = registerCustomPlaneFromFrame(state.selectedFace.planeFrame);
+    const matchedId = findMatchingCustomPlaneId(state.selectedFace.planeFrame);
+    state.selectedFace.workPlaneId = matchedId ?? registerCustomPlaneFromFrame(state.selectedFace.planeFrame);
   }
   snapCameraToPlane(state.selectedFace.workPlaneId);
   document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
