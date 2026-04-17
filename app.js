@@ -8,6 +8,9 @@ const state = {
   currentPlane: 'XY',
   viewMode: '2d',          // '2d' or '3d'
   currentTool: null,
+  extrudeMode: null,
+  booleanMode: null, // 'union-select' | 'subtract-base' | 'subtract-cutters'
+  subtractBaseId: null,
   gridSnap: true,
   gridVisible: true,
   sketches: [],
@@ -637,6 +640,81 @@ function buildCombinedExtrusionMesh(regions, depth) {
   return merged;
 }
 
+function clearExtrusionSelectionState() {
+  clearRegionPreviews();
+  state.regionCandidates = [];
+  state.selectedRegionIds.clear();
+  state.regionPickCycle = { key: null, index: 0 };
+}
+
+function deactivateExtrudeButtons() {
+  const fillBtn = document.getElementById('btn-extrude-fill');
+  const cutBtn = document.getElementById('btn-extrude-cut');
+  if (fillBtn) fillBtn.classList.remove('active');
+  if (cutBtn) cutBtn.classList.remove('active');
+}
+
+function deactivateBooleanButtons() {
+  const unionBtn = document.getElementById('btn-union');
+  const subtractBtn = document.getElementById('btn-subtract');
+  if (unionBtn) unionBtn.classList.remove('active');
+  if (subtractBtn) subtractBtn.classList.remove('active');
+}
+
+function exitBooleanWorkflow() {
+  if (!state.booleanMode) return;
+  state.booleanMode = null;
+  state.subtractBaseId = null;
+  state.selectedSolidIds.clear();
+  state.solidSelectionOrder = [];
+  state.selectedSolidId = null;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  updateSolidSelectionVisuals();
+  deactivateBooleanButtons();
+  document.getElementById('status-tool').textContent = 'Tool: Select';
+}
+
+function exitExtrudeSelectionMode() {
+  if (state.currentTool !== 'extrude-select' && !state.extrudeMode) return;
+  state.currentTool = null;
+  state.extrudeMode = null;
+  canvas.classList.remove('crosshair');
+  document.getElementById('status-tool').textContent = 'Tool: Select';
+  deactivateExtrudeButtons();
+  clearExtrusionSelectionState();
+}
+
+function beginExtrudeSelectionMode(mode = 'fill') {
+  const action = mode === 'cut' ? 'cut' : 'fill';
+  exitBooleanWorkflow();
+  if (state.viewMode === '3d') {
+    if (!enterFaceSketchPlane()) return;
+  }
+
+  const alreadyActive = state.currentTool === 'extrude-select' && state.extrudeMode === action;
+  if (alreadyActive) {
+    exitExtrudeSelectionMode();
+    cancelDraw();
+    return;
+  }
+
+  document.querySelectorAll('.tool-btn').forEach((b) => b.classList.remove('active'));
+  deactivateExtrudeButtons();
+  const modeBtn = document.getElementById(action === 'cut' ? 'btn-extrude-cut' : 'btn-extrude-fill');
+  if (modeBtn) modeBtn.classList.add('active');
+
+  state.currentTool = 'extrude-select';
+  state.extrudeMode = action;
+  canvas.classList.add('crosshair');
+  document.getElementById('status-tool').textContent = `Tool: Extrude (${action === 'cut' ? 'Cut' : 'Fill'})`;
+
+  state.selectedRegionIds.clear();
+  refreshExtrusionRegions();
+  cancelDraw();
+  setStatus(`Extrude (${action === 'cut' ? 'Cut' : 'Fill'}): click regions, then press Enter.`);
+}
+
 function extrudeSelectedRegions(mode = 'fill') {
   if (state.selectedRegionIds.size === 0) {
     setStatus('Select at least one region first.');
@@ -735,6 +813,7 @@ function extrudeSelectedRegions(mode = 'fill') {
   document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
   const btn3d = document.querySelector('.plane-btn[data-plane="3D"]');
   if (btn3d) btn3d.classList.add('active');
+  exitExtrudeSelectionMode();
 }
 
 function buildExtrudedMeshForRegion(region, depth, colorHex) {
@@ -1129,6 +1208,260 @@ function performBooleanOperation(op) {
   clearFaceHighlight();
   rebuildSolidsVisuals();
   setStatus(op === 'union' ? 'Union completed' : `Subtracted solid ${bId} from ${aId}`);
+}
+
+function completeBooleanWorkflowPreserveSelection() {
+  state.booleanMode = null;
+  state.subtractBaseId = null;
+  deactivateBooleanButtons();
+  document.getElementById('status-tool').textContent = 'Tool: Select';
+}
+
+function ensure3DViewForBoolean() {
+  if (state.viewMode !== '3d') {
+    switchTo3D();
+    document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
+    const btn3d = document.querySelector('.plane-btn[data-plane="3D"]');
+    if (btn3d) btn3d.classList.add('active');
+  }
+}
+
+function beginUnionWorkflow() {
+  const alreadyActive = state.booleanMode === 'union-select';
+  exitExtrudeSelectionMode();
+  if (alreadyActive) {
+    exitBooleanWorkflow();
+    setStatus('Cancelled');
+    return;
+  }
+  ensure3DViewForBoolean();
+  state.currentTool = null;
+  state.booleanMode = 'union-select';
+  state.subtractBaseId = null;
+  state.selectedSolidIds.clear();
+  state.solidSelectionOrder = [];
+  state.selectedSolidId = null;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  updateSolidSelectionVisuals();
+  deactivateBooleanButtons();
+  const unionBtn = document.getElementById('btn-union');
+  if (unionBtn) unionBtn.classList.add('active');
+  document.getElementById('status-tool').textContent = 'Tool: Union';
+  setStatus('Union: click solids (multiple), then press Enter.');
+}
+
+function beginSubtractWorkflow() {
+  const alreadyActive = state.booleanMode === 'subtract-base' || state.booleanMode === 'subtract-cutters';
+  exitExtrudeSelectionMode();
+  if (alreadyActive) {
+    exitBooleanWorkflow();
+    setStatus('Cancelled');
+    return;
+  }
+  ensure3DViewForBoolean();
+  state.currentTool = null;
+  state.booleanMode = 'subtract-base';
+  state.subtractBaseId = null;
+  state.selectedSolidIds.clear();
+  state.solidSelectionOrder = [];
+  state.selectedSolidId = null;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  updateSolidSelectionVisuals();
+  deactivateBooleanButtons();
+  const subtractBtn = document.getElementById('btn-subtract');
+  if (subtractBtn) subtractBtn.classList.add('active');
+  document.getElementById('status-tool').textContent = 'Tool: Subtract (pick base)';
+  setStatus('Subtract: click ONE base solid, then press Enter.');
+}
+
+function toggleBooleanSelection(id) {
+  if (state.selectedSolidIds.has(id)) {
+    state.selectedSolidIds.delete(id);
+    state.solidSelectionOrder = state.solidSelectionOrder.filter((sid) => sid !== id);
+  } else {
+    state.selectedSolidIds.add(id);
+    state.solidSelectionOrder = state.solidSelectionOrder.filter((sid) => sid !== id);
+    state.solidSelectionOrder.push(id);
+  }
+  state.selectedSolidId = state.solidSelectionOrder[state.solidSelectionOrder.length - 1] ?? null;
+}
+
+function handleBooleanSolidPick(intersection) {
+  const solidId = intersection?.object?.userData?.solidId ?? null;
+  if (!solidId) return;
+  if (state.booleanMode === 'union-select') {
+    toggleBooleanSelection(solidId);
+    updateSolidSelectionVisuals();
+    setStatus(`Union: ${state.selectedSolidIds.size} selected. Press Enter to confirm.`);
+    return;
+  }
+
+  if (state.booleanMode === 'subtract-base') {
+    state.subtractBaseId = solidId;
+    state.selectedSolidIds = new Set([solidId]);
+    state.solidSelectionOrder = [solidId];
+    state.selectedSolidId = solidId;
+    state.selectedFace = null;
+    clearFaceHighlight();
+    updateSolidSelectionVisuals();
+    setStatus(`Subtract: base solid ${solidId} selected. Press Enter.`);
+    return;
+  }
+
+  if (state.booleanMode === 'subtract-cutters') {
+    if (solidId === state.subtractBaseId) {
+      setStatus('Base solid cannot be used as a cutter.');
+      return;
+    }
+    toggleBooleanSelection(solidId);
+    state.selectedSolidIds.add(state.subtractBaseId);
+    updateSolidSelectionVisuals();
+    const cutterCount = [...state.selectedSolidIds].filter((id) => id !== state.subtractBaseId).length;
+    setStatus(`Subtract: ${cutterCount} cutter(s) selected. Press Enter to apply.`);
+  }
+}
+
+function executeUnionFromSelection() {
+  const ids = state.solidSelectionOrder.filter((id) => state.selectedSolidIds.has(id));
+  if (ids.length < 2) {
+    setStatus('Union requires at least 2 selected solids.');
+    return;
+  }
+  const meshes = ids.map(getSolidMeshById).filter(Boolean);
+  if (meshes.length !== ids.length) {
+    setStatus('Could not find one or more selected solids.');
+    return;
+  }
+  meshes.forEach((m) => m.updateMatrixWorld(true));
+
+  let resultMesh = prepareMeshForCSG(meshes[0]);
+  if (!resultMesh) {
+    setStatus('Union failed to prepare selected solids.');
+    return;
+  }
+  try {
+    for (let i = 1; i < meshes.length; i++) {
+      const nextMesh = prepareMeshForCSG(meshes[i]);
+      if (!nextMesh) {
+        setStatus('Union failed to prepare selected solids.');
+        return;
+      }
+      resultMesh = CSG.union(resultMesh, nextMesh);
+    }
+  } catch {
+    setStatus('Union failed');
+    return;
+  }
+  if (!resultMesh?.geometry) {
+    setStatus('Union produced no geometry');
+    return;
+  }
+
+  const resultId = state.nextSolidId++;
+  state.solids = state.solids.filter((s) => !ids.includes(s.id));
+  state.solids.push({
+    id: resultId,
+    color: SOLID_COLOR,
+    geometryData: geometryToData(resultMesh.geometry),
+  });
+  state.selectedSolidIds = new Set([resultId]);
+  state.solidSelectionOrder = [resultId];
+  state.selectedSolidId = resultId;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  rebuildSolidsVisuals();
+  completeBooleanWorkflowPreserveSelection();
+  setStatus(`Union: merged ${ids.length} solids.`);
+}
+
+function executeSubtractFromWorkflow() {
+  const baseId = state.subtractBaseId;
+  if (!baseId) {
+    setStatus('Select a base solid first.');
+    return;
+  }
+  const cutterIds = state.solidSelectionOrder.filter((id) => id !== baseId && state.selectedSolidIds.has(id));
+  if (!cutterIds.length) {
+    setStatus('Select at least one cutter solid.');
+    return;
+  }
+  const baseMesh = getSolidMeshById(baseId);
+  const cutterMeshes = cutterIds.map(getSolidMeshById).filter(Boolean);
+  if (!baseMesh || cutterMeshes.length !== cutterIds.length) {
+    setStatus('Could not find selected solids.');
+    return;
+  }
+  baseMesh.updateMatrixWorld(true);
+  cutterMeshes.forEach((m) => m.updateMatrixWorld(true));
+
+  let preparedBase = prepareMeshForCSG(baseMesh);
+  if (!preparedBase) {
+    setStatus('Subtract failed to prepare base solid.');
+    return;
+  }
+  let preparedCutter = prepareMeshForCSG(cutterMeshes[0]);
+  if (!preparedCutter) {
+    setStatus('Subtract failed to prepare cutter solids.');
+    return;
+  }
+  try {
+    for (let i = 1; i < cutterMeshes.length; i++) {
+      const nextCutter = prepareMeshForCSG(cutterMeshes[i]);
+      if (!nextCutter) {
+        setStatus('Subtract failed to prepare cutter solids.');
+        return;
+      }
+      preparedCutter = CSG.union(preparedCutter, nextCutter);
+    }
+    let resultMesh = CSG.subtract(preparedBase, preparedCutter);
+
+    const baseVolume = meshVolume(preparedBase.geometry);
+    const resultVolume = meshVolume(resultMesh?.geometry);
+    const overlapMesh = CSG.intersect(prepareMeshForCSG(baseMesh), preparedCutter);
+    const overlapVolume = meshVolume(overlapMesh?.geometry);
+    const overlapExists = overlapVolume > 1e-5;
+    const noMaterialRemoved = baseVolume > 1e-5 && Math.abs(resultVolume - baseVolume) < Math.max(baseVolume * 1e-4, 1e-5);
+    if (overlapExists && noMaterialRemoved) {
+      const retryBase = prepareMeshForCSG(baseMesh);
+      const retryCutter = prepareMeshForCSG(cutterMeshes[0], { flipWinding: true });
+      if (retryBase && retryCutter) {
+        let mergedRetryCutter = retryCutter;
+        for (let i = 1; i < cutterMeshes.length; i++) {
+          const next = prepareMeshForCSG(cutterMeshes[i], { flipWinding: true });
+          if (next) mergedRetryCutter = CSG.union(mergedRetryCutter, next);
+        }
+        const retryMesh = CSG.subtract(retryBase, mergedRetryCutter);
+        const retryVolume = meshVolume(retryMesh?.geometry);
+        if (retryVolume < resultVolume - 1e-6) resultMesh = retryMesh;
+      }
+    }
+
+    if (!resultMesh?.geometry) {
+      setStatus('Subtract produced no geometry');
+      return;
+    }
+
+    const resultId = state.nextSolidId++;
+    const removeIds = new Set([baseId, ...cutterIds]);
+    state.solids = state.solids.filter((s) => !removeIds.has(s.id));
+    state.solids.push({
+      id: resultId,
+      color: SOLID_COLOR,
+      geometryData: geometryToData(resultMesh.geometry),
+    });
+    state.selectedSolidIds = new Set([resultId]);
+    state.solidSelectionOrder = [resultId];
+    state.selectedSolidId = resultId;
+    state.selectedFace = null;
+    clearFaceHighlight();
+    rebuildSolidsVisuals();
+    completeBooleanWorkflowPreserveSelection();
+    setStatus(`Subtract: cut ${cutterIds.length} solid${cutterIds.length === 1 ? '' : 's'} from ${baseId}.`);
+  } catch {
+    setStatus('Subtract failed');
+  }
 }
 
 // ─── Shape Rendering ─────────────────────────────────────────────────
@@ -1605,6 +1938,12 @@ canvas.addEventListener('mousedown', (e) => {
 
   if (state.currentTool === null && state.viewMode === '3d') {
     const hit3d = pickSolidIntersection(e);
+    if (state.booleanMode) {
+      if (hit3d) {
+        handleBooleanSolidPick(hit3d);
+      }
+      return;
+    }
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     if (hit3d) {
       selectSolidFromIntersection(hit3d, additive);
@@ -1702,10 +2041,34 @@ document.addEventListener('keydown', (e) => {
     isMouseDown = false;
     controls.enabled = true;
     clearPreview();
+    if (state.currentTool === 'extrude-select') {
+      exitExtrudeSelectionMode();
+    }
+    if (state.booleanMode) {
+      exitBooleanWorkflow();
+    }
     setStatus('Cancelled');
   } else if (e.key === 'Enter') {
     if (state.currentTool === 'polygon' && state.drawingPoints.length >= 3) {
       finishPolygon();
+    } else if (state.currentTool === 'extrude-select') {
+      extrudeSelectedRegions(state.extrudeMode ?? 'fill');
+    } else if (state.booleanMode === 'union-select') {
+      executeUnionFromSelection();
+    } else if (state.booleanMode === 'subtract-base') {
+      if (!state.subtractBaseId) {
+        setStatus('Subtract: select a base solid first.');
+      } else {
+        state.booleanMode = 'subtract-cutters';
+        state.selectedSolidIds = new Set([state.subtractBaseId]);
+        state.solidSelectionOrder = [state.subtractBaseId];
+        state.selectedSolidId = state.subtractBaseId;
+        updateSolidSelectionVisuals();
+        document.getElementById('status-tool').textContent = 'Tool: Subtract (pick cutters)';
+        setStatus('Subtract: now click cutter solids, then press Enter.');
+      }
+    } else if (state.booleanMode === 'subtract-cutters') {
+      executeSubtractFromWorkflow();
     }
   } else if (e.key === 'Delete' || e.key === 'Backspace') {
     if (!state.currentTool && (state.selectedSketch || state.selectedSolidIds.size > 0 || state.selectedSolidId)) {
@@ -1717,6 +2080,7 @@ document.addEventListener('keydown', (e) => {
 // ─── Toolbar UI ──────────────────────────────────────────────────────
 document.querySelectorAll('.plane-btn').forEach(btn => {
   btn.addEventListener('click', () => {
+    if (state.booleanMode) exitBooleanWorkflow();
     document.querySelectorAll('.plane-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
 
@@ -1732,31 +2096,32 @@ document.querySelectorAll('.plane-btn').forEach(btn => {
 
 document.querySelectorAll('.tool-btn').forEach(btn => {
   btn.addEventListener('click', () => {
+    if (state.booleanMode) exitBooleanWorkflow();
     const tool = btn.dataset.tool;
     if (state.currentTool === tool) {
       btn.classList.remove('active');
       state.currentTool = null;
+      state.extrudeMode = null;
       canvas.classList.remove('crosshair');
       document.getElementById('status-tool').textContent = 'Tool: Select';
-      clearRegionPreviews();
-      state.regionCandidates = [];
-      state.selectedRegionIds.clear();
+      deactivateExtrudeButtons();
+      clearExtrusionSelectionState();
     } else {
       if (state.viewMode === '3d') {
         if (!enterFaceSketchPlane()) return;
       }
       document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+      deactivateExtrudeButtons();
       btn.classList.add('active');
       state.currentTool = tool;
+      state.extrudeMode = null;
       canvas.classList.add('crosshair');
       document.getElementById('status-tool').textContent = `Tool: ${tool.charAt(0).toUpperCase() + tool.slice(1)}`;
       if (tool === 'extrude-select') {
         state.selectedRegionIds.clear();
         refreshExtrusionRegions();
       } else {
-        clearRegionPreviews();
-        state.regionCandidates = [];
-        state.selectedRegionIds.clear();
+        clearExtrusionSelectionState();
       }
     }
     cancelDraw();
@@ -1764,22 +2129,24 @@ document.querySelectorAll('.tool-btn').forEach(btn => {
 });
 
 document.getElementById('btn-select').addEventListener('click', () => {
+  if (state.booleanMode) exitBooleanWorkflow();
   document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
   state.currentTool = null;
+  state.extrudeMode = null;
   canvas.classList.remove('crosshair');
   document.getElementById('status-tool').textContent = 'Tool: Select';
-  clearRegionPreviews();
-  state.regionCandidates = [];
-  state.selectedRegionIds.clear();
+  deactivateExtrudeButtons();
+  clearExtrusionSelectionState();
   cancelDraw();
 });
 
 document.getElementById('btn-delete').addEventListener('click', deleteSelected);
-document.getElementById('btn-extrude-fill').addEventListener('click', () => extrudeSelectedRegions('fill'));
-document.getElementById('btn-extrude-cut').addEventListener('click', () => extrudeSelectedRegions('cut'));
-document.getElementById('btn-union').addEventListener('click', () => performBooleanOperation('union'));
-document.getElementById('btn-subtract').addEventListener('click', () => performBooleanOperation('subtract'));
+document.getElementById('btn-extrude-fill').addEventListener('click', () => beginExtrudeSelectionMode('fill'));
+document.getElementById('btn-extrude-cut').addEventListener('click', () => beginExtrudeSelectionMode('cut'));
+document.getElementById('btn-union').addEventListener('click', beginUnionWorkflow);
+document.getElementById('btn-subtract').addEventListener('click', beginSubtractWorkflow);
 document.getElementById('btn-clear').addEventListener('click', () => {
+  if (state.booleanMode) exitBooleanWorkflow();
   state.sketches = state.sketches.filter(s => s.plane !== state.currentPlane);
   state.selectedSketch = null;
   state.selectedSolidIds.clear();
@@ -1792,6 +2159,7 @@ document.getElementById('btn-clear').addEventListener('click', () => {
   setStatus(`Cleared ${getPlaneLabel(state.currentPlane)} plane`);
 });
 document.getElementById('btn-reset-all').addEventListener('click', () => {
+  if (state.booleanMode) exitBooleanWorkflow();
   const hasContent = state.sketches.length > 0 || state.solids.length > 0;
   if (hasContent && !window.confirm('Clear all drawings and solids? This cannot be undone.')) {
     return;
