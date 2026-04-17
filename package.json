@@ -1,0 +1,9 @@
+{
+  "name": "cad-tool",
+  "version": "1.0.0",
+  "description": "Web-based CAD tool with 2D sketching and 3D extrusion",
+  "scripts": {
+    "start": "npx serve ."
+  },
+  "dependencies": {}
+}
