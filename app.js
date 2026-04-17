@@ -83,7 +83,7 @@ const planeHighlightGeo = new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE);
 const planeHighlightMat = new THREE.MeshBasicMaterial({
   color: 0x4a6cf7,
   transparent: true,
-  opacity: 0.04,
+  opacity: 0.015,
   side: THREE.DoubleSide,
   depthWrite: false,
 });
@@ -236,7 +236,6 @@ function getMouseOnPlane(event) {
 // ─── Shape Rendering ─────────────────────────────────────────────────
 const SHAPE_COLOR = 0x4a6cf7;
 const SHAPE_COLOR_SELECTED = 0xf44336;
-const SHAPE_FILL_OPACITY = 0.12;
 
 function createShapeMesh(sketch) {
   const group = new THREE.Group();
@@ -260,21 +259,6 @@ function createShapeMesh(sketch) {
     const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
     group.add(new THREE.Line(lineGeo, lineMat));
 
-    const fillGeo = new THREE.PlaneGeometry(w, h);
-    const fillMat = new THREE.MeshBasicMaterial({
-      color: SHAPE_COLOR,
-      transparent: true,
-      opacity: SHAPE_FILL_OPACITY,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const fillMesh = new THREE.Mesh(fillGeo, fillMat);
-    const center3D = to3D(cu, cv, sketch.plane);
-    fillMesh.position.copy(center3D);
-    if (sketch.plane === 'XZ') fillMesh.rotation.x = -Math.PI / 2;
-    else if (sketch.plane === 'YZ') fillMesh.rotation.y = Math.PI / 2;
-    group.add(fillMesh);
-
   } else if (sketch.type === 'circle') {
     const { cu, cv, radius } = sketch.data;
     const segments = 64;
@@ -290,23 +274,6 @@ function createShapeMesh(sketch) {
     const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
     group.add(new THREE.Line(lineGeo, lineMat));
 
-    const circleShape = new THREE.Shape();
-    circleShape.absarc(0, 0, radius, 0, Math.PI * 2, false);
-    const fillGeo = new THREE.ShapeGeometry(circleShape, segments);
-    const fillMat = new THREE.MeshBasicMaterial({
-      color: SHAPE_COLOR,
-      transparent: true,
-      opacity: SHAPE_FILL_OPACITY,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const fillMesh = new THREE.Mesh(fillGeo, fillMat);
-    const center3D = to3D(cu, cv, sketch.plane);
-    fillMesh.position.copy(center3D);
-    if (sketch.plane === 'XZ') fillMesh.rotation.x = -Math.PI / 2;
-    else if (sketch.plane === 'YZ') fillMesh.rotation.y = Math.PI / 2;
-    group.add(fillMesh);
-
   } else if (sketch.type === 'polygon') {
     const pts = sketch.data.points;
     if (pts.length < 2) return group;
@@ -316,30 +283,6 @@ function createShapeMesh(sketch) {
     const lineGeo = new THREE.BufferGeometry().setFromPoints(linePoints);
     const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
     group.add(new THREE.Line(lineGeo, lineMat));
-
-    if (pts.length >= 3) {
-      const shape = new THREE.Shape();
-      shape.moveTo(pts[0].u, pts[0].v);
-      for (let i = 1; i < pts.length; i++) {
-        shape.lineTo(pts[i].u, pts[i].v);
-      }
-      shape.closePath();
-      const fillGeo = new THREE.ShapeGeometry(shape);
-      const fillMat = new THREE.MeshBasicMaterial({
-        color: SHAPE_COLOR,
-        transparent: true,
-        opacity: SHAPE_FILL_OPACITY,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      const fillMesh = new THREE.Mesh(fillGeo, fillMat);
-      if (sketch.plane === 'XZ') {
-        fillMesh.rotation.x = -Math.PI / 2;
-      } else if (sketch.plane === 'YZ') {
-        fillMesh.rotation.y = Math.PI / 2;
-      }
-      group.add(fillMesh);
-    }
   }
 
   return group;
