@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import polygonClipping from 'https://cdn.jsdelivr.net/npm/polygon-clipping@0.15.7/+esm';
+import { CSG } from 'https://cdn.jsdelivr.net/npm/three-csg-ts@3.2.0/+esm';
 
 // ─── State ───────────────────────────────────────────────────────────
 const state = {
@@ -19,6 +20,10 @@ const state = {
   selectedRegionIds: new Set(),
   regionPickCycle: { key: null, index: 0 },
   solids: [],
+  selectedSolidIds: new Set(),
+  solidSelectionOrder: [],
+  selectedSolidId: null,
+  selectedFace: null,
   nextSolidId: 1,
   nextId: 1,
 };
@@ -209,6 +214,7 @@ const regionPreviewGroup = new THREE.Group();
 scene.add(regionPreviewGroup);
 const solidsGroup = new THREE.Group();
 scene.add(solidsGroup);
+let faceSelectionOverlay = null;
 
 // ─── Utility: Map 3D point to 2D coords on current plane ────────────
 function to2D(point3D, plane) {
@@ -243,6 +249,14 @@ function getMouseOnPlane(event) {
   coords2d.u = snapToGrid(coords2d.u);
   coords2d.v = snapToGrid(coords2d.v);
   return coords2d;
+}
+
+function getPointerNDC(event) {
+  const rect = canvas.getBoundingClientRect();
+  return new THREE.Vector2(
+    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    -((event.clientY - rect.top) / rect.height) * 2 + 1
+  );
 }
 
 function closeRing(points) {
@@ -525,6 +539,14 @@ function extrudeRegion(region, depth) {
   if (!region || !Number.isFinite(depth) || Math.abs(depth) < 1e-6) return;
 
   for (const polygonRings of region.polygons) {
+    const solidId = state.nextSolidId++;
+    const solidRecord = {
+      id: solidId,
+      plane: region.plane,
+      depth,
+      polygonRings,
+      color: new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex(),
+    };
     const shape = shapeFromRings(polygonRings);
     const geo = new THREE.ExtrudeGeometry(shape, {
       depth,
@@ -533,23 +555,17 @@ function extrudeRegion(region, depth) {
       steps: 1,
     });
     applyPlaneTransformToGeometry(geo, region.plane, 0);
-    const color = new THREE.Color().setHSL(Math.random(), 0.55, 0.55);
     const mesh = new THREE.Mesh(
       geo,
       new THREE.MeshStandardMaterial({
-        color,
+        color: solidRecord.color,
         metalness: 0.15,
         roughness: 0.7,
       })
     );
+    mesh.userData.solidId = solidId;
     solidsGroup.add(mesh);
-    state.solids.push({
-      id: state.nextSolidId++,
-      plane: region.plane,
-      depth,
-      polygonRings,
-      color: color.getHex(),
-    });
+    state.solids.push(solidRecord);
   }
 }
 
@@ -584,6 +600,7 @@ function extrudeSelectedRegions() {
 }
 
 function clearSolidsVisuals() {
+  clearFaceHighlight();
   while (solidsGroup.children.length) {
     const child = solidsGroup.children[0];
     solidsGroup.remove(child);
@@ -592,15 +609,46 @@ function clearSolidsVisuals() {
   }
 }
 
+function geometryToData(geometry) {
+  const g = geometry.clone();
+  g.computeVertexNormals();
+  const pos = g.getAttribute('position');
+  const norm = g.getAttribute('normal');
+  return {
+    positions: Array.from(pos.array),
+    normals: norm ? Array.from(norm.array) : null,
+    index: g.index ? Array.from(g.index.array) : null,
+  };
+}
+
+function geometryFromData(data) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(data.positions, 3));
+  if (data.normals && data.normals.length === data.positions.length) {
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(data.normals, 3));
+  } else {
+    g.computeVertexNormals();
+  }
+  if (data.index && data.index.length) {
+    g.setIndex(data.index);
+  }
+  return g;
+}
+
 function buildSolidMesh(record) {
-  const shape = shapeFromRings(record.polygonRings);
-  const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: record.depth,
-    bevelEnabled: false,
-    curveSegments: 48,
-    steps: 1,
-  });
-  applyPlaneTransformToGeometry(geo, record.plane, 0);
+  let geo;
+  if (record.geometryData) {
+    geo = geometryFromData(record.geometryData);
+  } else {
+    const shape = shapeFromRings(record.polygonRings);
+    geo = new THREE.ExtrudeGeometry(shape, {
+      depth: record.depth,
+      bevelEnabled: false,
+      curveSegments: 48,
+      steps: 1,
+    });
+    applyPlaneTransformToGeometry(geo, record.plane, 0);
+  }
   const mesh = new THREE.Mesh(
     geo,
     new THREE.MeshStandardMaterial({
@@ -609,6 +657,7 @@ function buildSolidMesh(record) {
       roughness: 0.7,
     })
   );
+  mesh.userData.solidId = record.id;
   solidsGroup.add(mesh);
 }
 
@@ -617,6 +666,159 @@ function rebuildSolidsVisuals() {
   for (const solid of state.solids) {
     buildSolidMesh(solid);
   }
+  updateSolidSelectionVisuals();
+}
+
+function clearFaceHighlight() {
+  if (!faceSelectionOverlay) return;
+  scene.remove(faceSelectionOverlay);
+  if (faceSelectionOverlay.geometry) faceSelectionOverlay.geometry.dispose();
+  if (faceSelectionOverlay.material) faceSelectionOverlay.material.dispose();
+  faceSelectionOverlay = null;
+}
+
+function updateSolidSelectionVisuals() {
+  for (const mesh of solidsGroup.children) {
+    const mat = mesh.material;
+    if (!mat || !mat.isMeshStandardMaterial) continue;
+    const solidId = mesh.userData.solidId;
+    const selected = state.selectedSolidIds.has(solidId);
+    const isPrimary = solidId === state.selectedSolidId;
+    mat.emissive.setHex(selected ? 0x2244aa : 0x000000);
+    mat.emissiveIntensity = isPrimary ? 0.45 : selected ? 0.24 : 0;
+  }
+}
+
+function showFaceHighlight(intersection) {
+  clearFaceHighlight();
+  if (!intersection?.face || !intersection.object?.geometry) return;
+  const geometry = intersection.object.geometry;
+  const position = geometry.attributes.position;
+  if (!position) return;
+
+  const ia = intersection.face.a;
+  const ib = intersection.face.b;
+  const ic = intersection.face.c;
+  const a = new THREE.Vector3().fromBufferAttribute(position, ia).applyMatrix4(intersection.object.matrixWorld);
+  const b = new THREE.Vector3().fromBufferAttribute(position, ib).applyMatrix4(intersection.object.matrixWorld);
+  const c = new THREE.Vector3().fromBufferAttribute(position, ic).applyMatrix4(intersection.object.matrixWorld);
+  const edgeGeo = new THREE.BufferGeometry().setFromPoints([a, b, c, a]);
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0xffa500 });
+  faceSelectionOverlay = new THREE.Line(edgeGeo, edgeMat);
+  scene.add(faceSelectionOverlay);
+}
+
+function pickSolidIntersection(event) {
+  if (solidsGroup.children.length === 0) return null;
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(getPointerNDC(event), activeCamera);
+  const intersects = raycaster.intersectObjects(solidsGroup.children, true);
+  return intersects.length ? intersects[0] : null;
+}
+
+function getSolidMeshById(id) {
+  return solidsGroup.children.find((m) => m.userData.solidId === id) ?? null;
+}
+
+function selectSolidFromIntersection(intersection, additive = false) {
+  const solidId = intersection?.object?.userData?.solidId ?? null;
+  state.selectedSketch = null;
+  if (!solidId) {
+    if (!additive) {
+      state.selectedSolidIds.clear();
+      state.solidSelectionOrder = [];
+      state.selectedSolidId = null;
+      state.selectedFace = null;
+      clearFaceHighlight();
+      updateSolidSelectionVisuals();
+    }
+    return;
+  }
+
+  if (additive) {
+    if (state.selectedSolidIds.has(solidId)) {
+      state.selectedSolidIds.delete(solidId);
+      state.solidSelectionOrder = state.solidSelectionOrder.filter((id) => id !== solidId);
+      if (state.selectedSolidId === solidId) {
+        state.selectedSolidId = state.solidSelectionOrder[state.solidSelectionOrder.length - 1] ?? null;
+      }
+      state.selectedFace = null;
+      clearFaceHighlight();
+    } else {
+      state.selectedSolidIds.add(solidId);
+      state.solidSelectionOrder = state.solidSelectionOrder.filter((id) => id !== solidId);
+      state.solidSelectionOrder.push(solidId);
+      state.selectedSolidId = solidId;
+      state.selectedFace = {
+        solidId,
+        faceIndex: intersection.faceIndex ?? null,
+      };
+      showFaceHighlight(intersection);
+    }
+  } else {
+    state.selectedSolidIds = new Set([solidId]);
+    state.solidSelectionOrder = [solidId];
+    state.selectedSolidId = solidId;
+    state.selectedFace = {
+      solidId,
+      faceIndex: intersection.faceIndex ?? null,
+    };
+    showFaceHighlight(intersection);
+  }
+
+  const count = state.selectedSolidIds.size;
+  setStatus(`Selected solid ${solidId} (${count} selected)`);
+  updateSolidSelectionVisuals();
+}
+
+function performBooleanOperation(op) {
+  if (state.selectedSolidIds.size !== 2) {
+    setStatus('Select exactly 2 solids in 3D (Shift/Cmd+click for multi-select).');
+    return;
+  }
+  const selectedOrdered = state.solidSelectionOrder.filter((id) => state.selectedSolidIds.has(id));
+  if (selectedOrdered.length !== 2) {
+    setStatus('Selection order invalid; reselect the two solids.');
+    return;
+  }
+  const [aId, bId] = selectedOrdered;
+  const meshA = getSolidMeshById(aId);
+  const meshB = getSolidMeshById(bId);
+  if (!meshA || !meshB) {
+    setStatus('Could not find selected solids.');
+    return;
+  }
+  meshA.updateMatrixWorld(true);
+  meshB.updateMatrixWorld(true);
+
+  let resultMesh;
+  try {
+    resultMesh = op === 'union' ? CSG.union(meshA, meshB) : CSG.subtract(meshA, meshB);
+  } catch (err) {
+    setStatus(`Boolean ${op} failed`);
+    return;
+  }
+  if (!resultMesh?.geometry) {
+    setStatus(`Boolean ${op} produced no geometry`);
+    return;
+  }
+  const resultId = state.nextSolidId++;
+  const baseColor = state.solids.find((s) => s.id === aId)?.color ?? 0x64748b;
+  const resultRecord = {
+    id: resultId,
+    color: baseColor,
+    geometryData: geometryToData(resultMesh.geometry),
+  };
+
+  state.solids = state.solids.filter((s) => s.id !== aId && s.id !== bId);
+  state.solids.push(resultRecord);
+  state.selectedSolidIds = new Set([resultId]);
+  state.solidSelectionOrder = [resultId];
+  state.selectedSolidId = resultId;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  rebuildSolidsVisuals();
+  setStatus(op === 'union' ? 'Union completed' : `Subtracted solid ${bId} from ${aId}`);
 }
 
 // ─── Shape Rendering ─────────────────────────────────────────────────
@@ -947,6 +1149,12 @@ function updateSketchList() {
     item.innerHTML = `${icon}<span class="shape-label">${label}</span><span class="shape-plane">${sketch.plane}</span>`;
     item.addEventListener('click', () => {
       state.selectedSketch = sketch;
+      state.selectedSolidIds.clear();
+      state.solidSelectionOrder = [];
+      state.selectedSolidId = null;
+      state.selectedFace = null;
+      clearFaceHighlight();
+      updateSolidSelectionVisuals();
       rebuildSketchVisuals();
     });
     list.appendChild(item);
@@ -958,6 +1166,25 @@ let isMouseDown = false;
 
 canvas.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
+
+  if (state.currentTool === null && state.viewMode === '3d') {
+    const hit3d = pickSolidIntersection(e);
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    if (hit3d) {
+      selectSolidFromIntersection(hit3d, additive);
+      return;
+    }
+    if (!additive) {
+      state.selectedSolidIds.clear();
+      state.solidSelectionOrder = [];
+      state.selectedSolidId = null;
+      state.selectedFace = null;
+      clearFaceHighlight();
+      updateSolidSelectionVisuals();
+    }
+    return;
+  }
+
   const coords = getMouseOnPlane(e);
   if (!coords) return;
 
@@ -979,6 +1206,12 @@ canvas.addEventListener('mousedown', (e) => {
   if (state.currentTool === null) {
     const hit = hitTestSketch(coords);
     state.selectedSketch = hit;
+    state.selectedSolidIds.clear();
+    state.solidSelectionOrder = [];
+    state.selectedSolidId = null;
+    state.selectedFace = null;
+    clearFaceHighlight();
+    updateSolidSelectionVisuals();
     rebuildSketchVisuals();
     return;
   }
@@ -1039,7 +1272,7 @@ document.addEventListener('keydown', (e) => {
       finishPolygon();
     }
   } else if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selectedSketch && !state.currentTool) {
+    if (!state.currentTool && (state.selectedSketch || state.selectedSolidIds.size > 0 || state.selectedSolidId)) {
       deleteSelected();
     }
   }
@@ -1104,9 +1337,17 @@ document.getElementById('btn-select').addEventListener('click', () => {
 
 document.getElementById('btn-delete').addEventListener('click', deleteSelected);
 document.getElementById('btn-extrude').addEventListener('click', extrudeSelectedRegions);
+document.getElementById('btn-union').addEventListener('click', () => performBooleanOperation('union'));
+document.getElementById('btn-subtract').addEventListener('click', () => performBooleanOperation('subtract'));
 document.getElementById('btn-clear').addEventListener('click', () => {
   state.sketches = state.sketches.filter(s => s.plane !== state.currentPlane);
   state.selectedSketch = null;
+  state.selectedSolidIds.clear();
+  state.solidSelectionOrder = [];
+  state.selectedSolidId = null;
+  state.selectedFace = null;
+  clearFaceHighlight();
+  updateSolidSelectionVisuals();
   rebuildSketchVisuals();
   setStatus(`Cleared ${state.currentPlane} plane`);
 });
@@ -1138,6 +1379,22 @@ function cancelDraw() {
 }
 
 function deleteSelected() {
+  if (state.selectedSolidIds.size > 0 || state.selectedSolidId) {
+    const toDelete = state.selectedSolidIds.size > 0
+      ? new Set(state.selectedSolidIds)
+      : new Set([state.selectedSolidId]);
+    const count = toDelete.size;
+    state.solids = state.solids.filter((s) => !toDelete.has(s.id));
+    state.selectedSolidIds.clear();
+    state.solidSelectionOrder = [];
+    state.selectedSolidId = null;
+    state.selectedFace = null;
+    clearFaceHighlight();
+    rebuildSolidsVisuals();
+    setStatus(`Deleted ${count} solid${count === 1 ? '' : 's'}`);
+    return;
+  }
+
   if (!state.selectedSketch) {
     setStatus('Nothing selected');
     return;
@@ -1180,6 +1437,10 @@ function loadProject() {
       state.nextId = data.nextId || 1;
       state.nextSolidId = data.nextSolidId || 1;
       state.selectedSketch = null;
+      state.selectedSolidIds.clear();
+      state.solidSelectionOrder = [];
+      state.selectedSolidId = null;
+      state.selectedFace = null;
       rebuildSketchVisuals();
       rebuildSolidsVisuals();
       setStatus('Project loaded from storage');
@@ -1202,6 +1463,10 @@ function loadProject() {
         state.nextId = data.nextId || 1;
         state.nextSolidId = data.nextSolidId || 1;
         state.selectedSketch = null;
+        state.selectedSolidIds.clear();
+        state.solidSelectionOrder = [];
+        state.selectedSolidId = null;
+        state.selectedFace = null;
         rebuildSketchVisuals();
         rebuildSolidsVisuals();
         setStatus('Project loaded from file');
