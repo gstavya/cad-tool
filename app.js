@@ -72,6 +72,8 @@ function resolvePlaneFrame(planeId = state.currentPlane) {
   return BASE_PLANE_FRAMES[planeId] ?? state.customPlanes[planeId] ?? null;
 }
 
+const SOLID_COLOR = 0xb0b7c3;
+
 function getPlaneLabel(planeId = state.currentPlane) {
   return resolvePlaneFrame(planeId)?.label ?? String(planeId);
 }
@@ -575,9 +577,11 @@ function refreshExtrusionRegions() {
           transparent: true,
           opacity: isSelected ? 0.42 : 0.18,
           side: THREE.DoubleSide,
+          depthTest: false,
           depthWrite: false,
         })
       );
+      mesh.renderOrder = 900;
       mesh.userData.regionId = region.id;
       regionPreviewGroup.add(mesh);
     }
@@ -600,20 +604,46 @@ function pickRegionAt(coords) {
   return hits[state.regionPickCycle.index];
 }
 
-function extrudeRegion(region, depth) {
-  if (!region || !Number.isFinite(depth) || Math.abs(depth) < 1e-6) return;
-  const colorHex = new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex();
-  const mesh = buildExtrudedMeshForRegion(region, depth, colorHex);
-  if (!mesh) return;
-  addSolidFromMesh(mesh, { color: colorHex });
+function pickRegionFromEvent(event) {
+  if (!regionPreviewGroup.children.length) return null;
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(getPointerNDC(event), activeCamera);
+  const hits = raycaster.intersectObjects(regionPreviewGroup.children, true);
+  for (const hit of hits) {
+    const regionId = hit.object?.userData?.regionId;
+    if (!regionId) continue;
+    const region = state.regionCandidates.find((r) => r.id === regionId);
+    if (region) return region;
+  }
+  return null;
 }
 
-function extrudeSelectedRegions() {
+function extrudeRegion(region, depth) {
+  if (!region || !Number.isFinite(depth) || Math.abs(depth) < 1e-6) return;
+  const mesh = buildExtrudedMeshForRegion(region, depth, SOLID_COLOR);
+  if (!mesh) return;
+  addSolidFromMesh(mesh, { color: SOLID_COLOR });
+}
+
+function buildCombinedExtrusionMesh(regions, depth) {
+  const regionMeshes = regions
+    .map((region) => buildExtrudedMeshForRegion(region, depth, SOLID_COLOR))
+    .filter(Boolean);
+  if (!regionMeshes.length) return null;
+  let merged = regionMeshes[0];
+  for (let i = 1; i < regionMeshes.length; i++) {
+    merged = CSG.union(merged, regionMeshes[i]);
+  }
+  return merged;
+}
+
+function extrudeSelectedRegions(mode = 'fill') {
   if (state.selectedRegionIds.size === 0) {
     setStatus('Select at least one region first.');
     return;
   }
-  const input = window.prompt('Extrusion depth (positive or negative):', '5');
+  const action = mode === 'cut' ? 'cut' : 'fill';
+  const input = window.prompt(`Extrude (${action}) depth (positive or negative):`, '5');
   if (input === null) return;
   const depth = Number(input);
   if (!Number.isFinite(depth) || Math.abs(depth) < 1e-6) {
@@ -626,26 +656,81 @@ function extrudeSelectedRegions() {
     return;
   }
 
-  const colorHex = new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex();
-  const regionMeshes = selectedRegions
-    .map((region) => buildExtrudedMeshForRegion(region, depth, colorHex))
-    .filter(Boolean);
-
-  if (!regionMeshes.length) {
+  const extrusionMesh = buildCombinedExtrusionMesh(selectedRegions, depth);
+  if (!extrusionMesh) {
     setStatus('Could not build extrusion geometry from selected regions.');
     return;
   }
 
-  let resultMesh = regionMeshes[0];
-  for (let i = 1; i < regionMeshes.length; i++) {
-    resultMesh = CSG.union(resultMesh, regionMeshes[i]);
+  if (action === 'fill') {
+    addSolidFromMesh(extrusionMesh, { color: SOLID_COLOR });
+  } else {
+    if (state.solids.length === 0) {
+      setStatus('No solids to cut. Create or extrude a solid first.');
+      return;
+    }
+
+    extrusionMesh.updateMatrixWorld(true);
+    let modifiedCount = 0;
+    let removedCount = 0;
+    const updatedSolids = [];
+    for (const solid of state.solids) {
+      const solidMesh = getSolidMeshById(solid.id);
+      if (!solidMesh) {
+        updatedSolids.push(solid);
+        continue;
+      }
+      solidMesh.updateMatrixWorld(true);
+      const preparedSolid = prepareMeshForCSG(solidMesh);
+      const preparedCutter = prepareMeshForCSG(extrusionMesh);
+      if (!preparedSolid || !preparedCutter) {
+        updatedSolids.push(solid);
+        continue;
+      }
+
+      const overlapMesh = CSG.intersect(preparedSolid, preparedCutter);
+      const overlapVolume = meshVolume(overlapMesh?.geometry);
+      if (overlapVolume <= 1e-6) {
+        updatedSolids.push(solid);
+        continue;
+      }
+
+      const cutMesh = CSG.subtract(preparedSolid, preparedCutter);
+      const cutVolume = meshVolume(cutMesh?.geometry);
+      modifiedCount++;
+      if (!cutMesh?.geometry || cutVolume <= 1e-6) {
+        removedCount++;
+        continue;
+      }
+
+      updatedSolids.push({
+        ...solid,
+        color: SOLID_COLOR,
+        geometryData: geometryToData(cutMesh.geometry),
+      });
+    }
+
+    state.solids = updatedSolids;
+    state.selectedSolidIds.clear();
+    state.solidSelectionOrder = [];
+    state.selectedSolidId = null;
+    state.selectedFace = null;
+    clearFaceHighlight();
+    rebuildSolidsVisuals();
+
+    if (modifiedCount === 0) {
+      setStatus('Extrude (Cut): no intersecting solids were found.');
+    } else {
+      setStatus(`Extrude (Cut): modified ${modifiedCount} solid${modifiedCount === 1 ? '' : 's'}${removedCount ? `, removed ${removedCount}` : ''}.`);
+    }
   }
-  addSolidFromMesh(resultMesh, { color: colorHex });
 
   const count = selectedRegions.length;
   state.selectedRegionIds.clear();
   refreshExtrusionRegions();
-  setStatus(`Extruded ${count} region${count === 1 ? '' : 's'} by ${depth}`);
+  if (action === 'fill') {
+    setStatus(`Extrude (Fill): ${count} region${count === 1 ? '' : 's'} by ${depth}`);
+  }
   switchTo3D();
   document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
   const btn3d = document.querySelector('.plane-btn[data-plane="3D"]');
@@ -682,7 +767,7 @@ function addSolidFromMesh(mesh, { color }) {
   const geometryData = geometryToData(mesh.geometry);
   const record = {
     id: resultId,
-    color,
+    color: SOLID_COLOR,
     geometryData,
   };
   state.solids.push(record);
@@ -743,7 +828,7 @@ function buildSolidMesh(record) {
   const mesh = new THREE.Mesh(
     geo,
     new THREE.MeshStandardMaterial({
-      color: record.color ?? 0x64748b,
+      color: SOLID_COLOR,
       metalness: 0.15,
       roughness: 0.7,
     })
@@ -1029,10 +1114,9 @@ function performBooleanOperation(op) {
     return;
   }
   const resultId = state.nextSolidId++;
-  const baseColor = state.solids.find((s) => s.id === aId)?.color ?? 0x64748b;
   const resultRecord = {
     id: resultId,
-    color: baseColor,
+    color: SOLID_COLOR,
     geometryData: geometryToData(resultMesh.geometry),
   };
 
@@ -1048,8 +1132,34 @@ function performBooleanOperation(op) {
 }
 
 // ─── Shape Rendering ─────────────────────────────────────────────────
-const SHAPE_COLOR = 0x4a6cf7;
-const SHAPE_COLOR_SELECTED = 0xf44336;
+const SHAPE_COLOR = 0xff2b2b;
+const SHAPE_COLOR_SELECTED = 0x2563eb;
+
+function makeOverlayLineMaterial(color = SHAPE_COLOR) {
+  return new THREE.LineBasicMaterial({
+    color,
+    linewidth: 2,
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+  });
+}
+
+function makeOverlayDashedMaterial(color = SHAPE_COLOR) {
+  return new THREE.LineDashedMaterial({
+    color,
+    dashSize: 0.3,
+    gapSize: 0.15,
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+  });
+}
+
+function configureOverlayObject(obj) {
+  if (!obj) return;
+  obj.renderOrder = 1000;
+}
 
 function createShapeMesh(sketch) {
   const group = new THREE.Group();
@@ -1070,8 +1180,10 @@ function createShapeMesh(sketch) {
       to3D(u1, v1, sketch.plane),
     ];
     const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
-    const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
-    group.add(new THREE.Line(lineGeo, lineMat));
+    const lineMat = makeOverlayLineMaterial(SHAPE_COLOR);
+    const line = new THREE.Line(lineGeo, lineMat);
+    configureOverlayObject(line);
+    group.add(line);
 
   } else if (sketch.type === 'circle') {
     const { cu, cv, radius } = sketch.data;
@@ -1085,8 +1197,10 @@ function createShapeMesh(sketch) {
       circlePoints.push(to3D(u, v, sketch.plane));
     }
     const lineGeo = new THREE.BufferGeometry().setFromPoints(circlePoints);
-    const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
-    group.add(new THREE.Line(lineGeo, lineMat));
+    const lineMat = makeOverlayLineMaterial(SHAPE_COLOR);
+    const line = new THREE.Line(lineGeo, lineMat);
+    configureOverlayObject(line);
+    group.add(line);
 
   } else if (sketch.type === 'polygon') {
     const pts = sketch.data.points;
@@ -1095,8 +1209,10 @@ function createShapeMesh(sketch) {
     const linePoints = pts.map(p => to3D(p.u, p.v, sketch.plane));
     linePoints.push(linePoints[0].clone());
     const lineGeo = new THREE.BufferGeometry().setFromPoints(linePoints);
-    const lineMat = new THREE.LineBasicMaterial({ color: SHAPE_COLOR, linewidth: 2 });
-    group.add(new THREE.Line(lineGeo, lineMat));
+    const lineMat = makeOverlayLineMaterial(SHAPE_COLOR);
+    const line = new THREE.Line(lineGeo, lineMat);
+    configureOverlayObject(line);
+    group.add(line);
   }
 
   return group;
@@ -1154,9 +1270,9 @@ function updateDrawPreview(coords) {
       to3D(state.drawStart.u, state.drawStart.v, state.currentPlane),
     ];
     const geo = new THREE.BufferGeometry().setFromPoints(points);
-    const mat = new THREE.LineDashedMaterial({ color: 0x22c55e, dashSize: 0.3, gapSize: 0.15, linewidth: 1 });
+    const mat = makeOverlayLineMaterial(SHAPE_COLOR);
     state.drawPreview = new THREE.Line(geo, mat);
-    state.drawPreview.computeLineDistances();
+    configureOverlayObject(state.drawPreview);
     scene.add(state.drawPreview);
 
   } else if (state.currentTool === 'circle' && state.drawStart) {
@@ -1172,8 +1288,9 @@ function updateDrawPreview(coords) {
       circlePoints.push(to3D(u, v, state.currentPlane));
     }
     const geo = new THREE.BufferGeometry().setFromPoints(circlePoints);
-    const mat = new THREE.LineDashedMaterial({ color: 0x22c55e, dashSize: 0.3, gapSize: 0.15 });
+    const mat = makeOverlayDashedMaterial(SHAPE_COLOR);
     state.drawPreview = new THREE.Line(geo, mat);
+    configureOverlayObject(state.drawPreview);
     state.drawPreview.computeLineDistances();
     scene.add(state.drawPreview);
 
@@ -1194,18 +1311,25 @@ function updatePolygonPreview(hoverCoords) {
     points.push(to3D(state.drawingPoints[0].u, state.drawingPoints[0].v, state.currentPlane));
   }
   const geo = new THREE.BufferGeometry().setFromPoints(points);
-  const mat = new THREE.LineDashedMaterial({ color: 0x22c55e, dashSize: 0.3, gapSize: 0.15 });
+  const mat = makeOverlayDashedMaterial(SHAPE_COLOR);
   state.drawPreview = new THREE.Line(geo, mat);
+  configureOverlayObject(state.drawPreview);
   state.drawPreview.computeLineDistances();
   scene.add(state.drawPreview);
 
   // Dot at first point when closable
   if (state.drawingPoints.length >= 3) {
     const dotGeo = new THREE.SphereGeometry(0.15);
-    const dotMat = new THREE.MeshBasicMaterial({ color: 0xf44336 });
+    const dotMat = new THREE.MeshBasicMaterial({
+      color: 0xf44336,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+    });
     const dot = new THREE.Mesh(dotGeo, dotMat);
     const firstPt = to3D(state.drawingPoints[0].u, state.drawingPoints[0].v, state.currentPlane);
     dot.position.copy(firstPt);
+    configureOverlayObject(dot);
     state.polygonPreviewLine = dot;
     scene.add(dot);
   }
@@ -1213,11 +1337,18 @@ function updatePolygonPreview(hoverCoords) {
   // Dots at all placed vertices
   for (const p of state.drawingPoints) {
     const dGeo = new THREE.SphereGeometry(0.1);
-    const dMat = new THREE.MeshBasicMaterial({ color: 0x4a6cf7 });
+    const dMat = new THREE.MeshBasicMaterial({
+      color: SHAPE_COLOR,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+    });
     const d = new THREE.Mesh(dGeo, dMat);
     d.position.copy(to3D(p.u, p.v, state.currentPlane));
+    configureOverlayObject(d);
     if (!state.polygonPreviewLine) {
       state.polygonPreviewLine = new THREE.Group();
+      configureOverlayObject(state.polygonPreviewLine);
       scene.add(state.polygonPreviewLine);
     }
     if (state.polygonPreviewLine.isGroup) {
@@ -1290,11 +1421,90 @@ function finishCircle(coords) {
   setStatus(`Circle created on ${sketch.plane}`);
 }
 
+function almostEqual(a, b, eps = 1e-6) {
+  return Math.abs(a - b) <= eps;
+}
+
+function pointsEqual(p1, p2, eps = 1e-6) {
+  return almostEqual(p1.u, p2.u, eps) && almostEqual(p1.v, p2.v, eps);
+}
+
+function orient2D(a, b, c) {
+  return (b.u - a.u) * (c.v - a.v) - (b.v - a.v) * (c.u - a.u);
+}
+
+function onSegment2D(a, b, p, eps = 1e-6) {
+  return (
+    p.u <= Math.max(a.u, b.u) + eps &&
+    p.u >= Math.min(a.u, b.u) - eps &&
+    p.v <= Math.max(a.v, b.v) + eps &&
+    p.v >= Math.min(a.v, b.v) - eps
+  );
+}
+
+function segmentsIntersect2D(a1, a2, b1, b2, eps = 1e-6) {
+  const o1 = orient2D(a1, a2, b1);
+  const o2 = orient2D(a1, a2, b2);
+  const o3 = orient2D(b1, b2, a1);
+  const o4 = orient2D(b1, b2, a2);
+
+  if ((o1 > eps && o2 < -eps || o1 < -eps && o2 > eps)
+    && (o3 > eps && o4 < -eps || o3 < -eps && o4 > eps)) {
+    return true;
+  }
+
+  if (Math.abs(o1) <= eps && onSegment2D(a1, a2, b1, eps)) return true;
+  if (Math.abs(o2) <= eps && onSegment2D(a1, a2, b2, eps)) return true;
+  if (Math.abs(o3) <= eps && onSegment2D(b1, b2, a1, eps)) return true;
+  if (Math.abs(o4) <= eps && onSegment2D(b1, b2, a2, eps)) return true;
+  return false;
+}
+
+function isSelfIntersectingPolygon(points) {
+  const n = points.length;
+  if (n < 4) return false;
+
+  for (let i = 0; i < n; i++) {
+    const a1 = points[i];
+    const a2 = points[(i + 1) % n];
+    for (let j = i + 1; j < n; j++) {
+      const b1 = points[j];
+      const b2 = points[(j + 1) % n];
+
+      const areSameEdge = i === j;
+      const areAdjacent = Math.abs(i - j) === 1 || (i === 0 && j === n - 1);
+      if (areSameEdge || areAdjacent) continue;
+
+      if (segmentsIntersect2D(a1, a2, b1, b2)) {
+        return true;
+      }
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const areAdjacent = Math.abs(i - j) === 1 || (i === 0 && j === n - 1);
+      if (areAdjacent) continue;
+      if (pointsEqual(points[i], points[j])) return true;
+    }
+  }
+  return false;
+}
+
 function finishPolygon() {
   if (state.drawingPoints.length < 3) {
     state.drawingPoints = [];
     clearPreview();
     setStatus('Polygon needs at least 3 points');
+    return;
+  }
+
+  if (isSelfIntersectingPolygon(state.drawingPoints)) {
+    state.drawingPoints = [];
+    clearPreview();
+    const errMsg = 'Invalid polygon: self-intersections are not allowed. Redraw it.';
+    setStatus(errMsg);
+    window.alert(errMsg);
     return;
   }
 
@@ -1415,7 +1625,7 @@ canvas.addEventListener('mousedown', (e) => {
   if (!coords) return;
 
   if (state.currentTool === 'extrude-select') {
-    const region = pickRegionAt(coords);
+    const region = pickRegionFromEvent(e) ?? pickRegionAt(coords);
     if (!region) {
       setStatus('No region here. Click inside a highlighted region.');
       return;
@@ -1565,7 +1775,8 @@ document.getElementById('btn-select').addEventListener('click', () => {
 });
 
 document.getElementById('btn-delete').addEventListener('click', deleteSelected);
-document.getElementById('btn-extrude').addEventListener('click', extrudeSelectedRegions);
+document.getElementById('btn-extrude-fill').addEventListener('click', () => extrudeSelectedRegions('fill'));
+document.getElementById('btn-extrude-cut').addEventListener('click', () => extrudeSelectedRegions('cut'));
 document.getElementById('btn-union').addEventListener('click', () => performBooleanOperation('union'));
 document.getElementById('btn-subtract').addEventListener('click', () => performBooleanOperation('subtract'));
 document.getElementById('btn-clear').addEventListener('click', () => {
