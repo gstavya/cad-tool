@@ -24,9 +24,89 @@ const state = {
   solidSelectionOrder: [],
   selectedSolidId: null,
   selectedFace: null,
+  customPlanes: {},
+  nextWorkPlaneId: 1,
   nextSolidId: 1,
   nextId: 1,
 };
+
+const BASE_PLANE_FRAMES = {
+  XY: {
+    id: 'XY',
+    label: 'XY',
+    origin: [0, 0, 0],
+    ex: [1, 0, 0],
+    ey: [0, 1, 0],
+    ez: [0, 0, 1],
+    gridKey: 'XY',
+  },
+  XZ: {
+    id: 'XZ',
+    label: 'XZ',
+    origin: [0, 0, 0],
+    ex: [1, 0, 0],
+    ey: [0, 0, 1],
+    ez: [0, 1, 0],
+    gridKey: 'XZ',
+  },
+  YZ: {
+    id: 'YZ',
+    label: 'YZ',
+    origin: [0, 0, 0],
+    ex: [0, 1, 0],
+    ey: [0, 0, 1],
+    ez: [1, 0, 0],
+    gridKey: 'YZ',
+  },
+};
+
+function vecFromArray(arr) {
+  return new THREE.Vector3(arr[0], arr[1], arr[2]);
+}
+
+function arrayFromVec(v) {
+  return [v.x, v.y, v.z];
+}
+
+function resolvePlaneFrame(planeId = state.currentPlane) {
+  return BASE_PLANE_FRAMES[planeId] ?? state.customPlanes[planeId] ?? null;
+}
+
+function getPlaneLabel(planeId = state.currentPlane) {
+  return resolvePlaneFrame(planeId)?.label ?? String(planeId);
+}
+
+function ensureCurrentPlaneValid() {
+  if (!resolvePlaneFrame(state.currentPlane)) {
+    state.currentPlane = 'XY';
+  }
+}
+
+function setMeshToPlaneFrame(mesh, planeId) {
+  const frame = resolvePlaneFrame(planeId);
+  if (!frame) return;
+  const ex = vecFromArray(frame.ex);
+  const ey = vecFromArray(frame.ey);
+  const ez = vecFromArray(frame.ez);
+  const origin = vecFromArray(frame.origin);
+  const matrix = new THREE.Matrix4().makeBasis(ex, ey, ez);
+  mesh.quaternion.setFromRotationMatrix(matrix);
+  mesh.position.copy(origin);
+}
+
+function registerCustomPlaneFromFrame(frame) {
+  const id = `WP${state.nextWorkPlaneId++}`;
+  state.customPlanes[id] = {
+    id,
+    label: `Face ${state.nextWorkPlaneId - 1}`,
+    origin: arrayFromVec(frame.origin),
+    ex: arrayFromVec(frame.ex),
+    ey: arrayFromVec(frame.ey),
+    ez: arrayFromVec(frame.ez),
+    gridKey: null,
+  };
+  return id;
+}
 
 // ─── Three.js Setup ──────────────────────────────────────────────────
 const canvas = document.getElementById('viewport');
@@ -102,15 +182,7 @@ const planeHighlight = new THREE.Mesh(planeHighlightGeo, planeHighlightMat);
 scene.add(planeHighlight);
 
 function updatePlaneHighlight() {
-  planeHighlight.rotation.set(0, 0, 0);
-  planeHighlight.position.set(0, 0, 0);
-  if (state.currentPlane === 'XY') {
-    // default
-  } else if (state.currentPlane === 'XZ') {
-    planeHighlight.rotation.x = -Math.PI / 2;
-  } else if (state.currentPlane === 'YZ') {
-    planeHighlight.rotation.y = Math.PI / 2;
-  }
+  setMeshToPlaneFrame(planeHighlight, state.currentPlane);
 }
 updatePlaneHighlight();
 
@@ -121,20 +193,14 @@ const rayPlaneMesh = new THREE.Mesh(rayPlaneGeo, rayPlaneMat);
 scene.add(rayPlaneMesh);
 
 function updateRayPlane() {
-  rayPlaneMesh.rotation.set(0, 0, 0);
-  rayPlaneMesh.position.set(0, 0, 0);
-  if (state.currentPlane === 'XY') {
-    // default
-  } else if (state.currentPlane === 'XZ') {
-    rayPlaneMesh.rotation.x = -Math.PI / 2;
-  } else if (state.currentPlane === 'YZ') {
-    rayPlaneMesh.rotation.y = Math.PI / 2;
-  }
+  setMeshToPlaneFrame(rayPlaneMesh, state.currentPlane);
 }
 updateRayPlane();
 
 // ─── Camera / View Switching ─────────────────────────────────────────
 function snapCameraToPlane(plane) {
+  const frame = resolvePlaneFrame(plane);
+  if (!frame) return;
   state.viewMode = '2d';
   state.currentPlane = plane;
   activeCamera = orthoCamera;
@@ -145,32 +211,26 @@ function snapCameraToPlane(plane) {
   controls.enableZoom = true;
 
   const D = 50;
-  controls.target.set(0, 0, 0);
-
-  if (plane === 'XY') {
-    orthoCamera.position.set(0, 0, D);
-    orthoCamera.up.set(0, 1, 0);
-  } else if (plane === 'XZ') {
-    orthoCamera.position.set(0, D, 0);
-    orthoCamera.up.set(0, 0, -1);
-  } else if (plane === 'YZ') {
-    orthoCamera.position.set(D, 0, 0);
-    orthoCamera.up.set(0, 1, 0);
-  }
-
-  orthoCamera.lookAt(0, 0, 0);
+  const origin = vecFromArray(frame.origin);
+  const normal = vecFromArray(frame.ez);
+  const up = vecFromArray(frame.ey);
+  controls.target.copy(origin);
+  orthoCamera.position.copy(origin.clone().addScaledVector(normal, D));
+  orthoCamera.up.copy(up);
+  orthoCamera.lookAt(origin);
   controls.update();
 
   updatePlaneHighlight();
   updateRayPlane();
 
   // Show only the active grid in 2D mode
+  const gridKey = frame.gridKey;
   Object.entries(grids).forEach(([key, g]) => {
-    g.visible = state.gridVisible && key === plane;
+    g.visible = state.gridVisible && !!gridKey && key === gridKey;
   });
 
-  document.getElementById('view-badge').textContent = `${plane} Plane`;
-  document.getElementById('status-plane').textContent = `Plane: ${plane}`;
+  document.getElementById('view-badge').textContent = `${getPlaneLabel(plane)} Plane`;
+  document.getElementById('status-plane').textContent = `Plane: ${getPlaneLabel(plane)}`;
   refreshExtrusionRegions();
 }
 
@@ -193,7 +253,7 @@ function switchTo3D() {
   });
 
   document.getElementById('view-badge').textContent = '3D View';
-  document.getElementById('status-plane').textContent = `Plane: ${state.currentPlane}`;
+  document.getElementById('status-plane').textContent = `Plane: ${getPlaneLabel(state.currentPlane)}`;
   refreshExtrusionRegions();
 }
 
@@ -218,15 +278,22 @@ let faceSelectionOverlay = null;
 
 // ─── Utility: Map 3D point to 2D coords on current plane ────────────
 function to2D(point3D, plane) {
-  if (plane === 'XY') return { u: point3D.x, v: point3D.y };
-  if (plane === 'XZ') return { u: point3D.x, v: point3D.z };
-  if (plane === 'YZ') return { u: point3D.y, v: point3D.z };
+  const frame = resolvePlaneFrame(plane);
+  if (!frame) return { u: 0, v: 0 };
+  const origin = vecFromArray(frame.origin);
+  const ex = vecFromArray(frame.ex);
+  const ey = vecFromArray(frame.ey);
+  const rel = point3D.clone().sub(origin);
+  return { u: rel.dot(ex), v: rel.dot(ey) };
 }
 
 function to3D(u, v, plane) {
-  if (plane === 'XY') return new THREE.Vector3(u, v, 0);
-  if (plane === 'XZ') return new THREE.Vector3(u, 0, v);
-  if (plane === 'YZ') return new THREE.Vector3(0, u, v);
+  const frame = resolvePlaneFrame(plane);
+  if (!frame) return new THREE.Vector3();
+  const origin = vecFromArray(frame.origin);
+  const ex = vecFromArray(frame.ex);
+  const ey = vecFromArray(frame.ey);
+  return origin.clone().addScaledVector(ex, u).addScaledVector(ey, v);
 }
 
 function snapToGrid(val, gridSize = 1) {
@@ -451,24 +518,18 @@ function shapeFromRings(rings) {
 }
 
 function getPlaneAxes(plane) {
-  if (plane === 'XY') {
+  const frame = resolvePlaneFrame(plane);
+  if (!frame) {
     return {
       ex: new THREE.Vector3(1, 0, 0),
       ey: new THREE.Vector3(0, 1, 0),
       ez: new THREE.Vector3(0, 0, 1),
     };
   }
-  if (plane === 'XZ') {
-    return {
-      ex: new THREE.Vector3(1, 0, 0),
-      ey: new THREE.Vector3(0, 0, 1),
-      ez: new THREE.Vector3(0, 1, 0),
-    };
-  }
   return {
-    ex: new THREE.Vector3(0, 1, 0),
-    ey: new THREE.Vector3(0, 0, 1),
-    ez: new THREE.Vector3(1, 0, 0),
+    ex: vecFromArray(frame.ex),
+    ey: vecFromArray(frame.ey),
+    ez: vecFromArray(frame.ez),
   };
 }
 
@@ -476,6 +537,10 @@ function applyPlaneTransformToGeometry(geometry, plane, normalOffset = 0) {
   const axes = getPlaneAxes(plane);
   const matrix = new THREE.Matrix4().makeBasis(axes.ex, axes.ey, axes.ez);
   geometry.applyMatrix4(matrix);
+  const frame = resolvePlaneFrame(plane);
+  if (frame) {
+    geometry.translate(frame.origin[0], frame.origin[1], frame.origin[2]);
+  }
   if (normalOffset !== 0) {
     geometry.translate(
       axes.ez.x * normalOffset,
@@ -537,36 +602,10 @@ function pickRegionAt(coords) {
 
 function extrudeRegion(region, depth) {
   if (!region || !Number.isFinite(depth) || Math.abs(depth) < 1e-6) return;
-
-  for (const polygonRings of region.polygons) {
-    const solidId = state.nextSolidId++;
-    const solidRecord = {
-      id: solidId,
-      plane: region.plane,
-      depth,
-      polygonRings,
-      color: new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex(),
-    };
-    const shape = shapeFromRings(polygonRings);
-    const geo = new THREE.ExtrudeGeometry(shape, {
-      depth,
-      bevelEnabled: false,
-      curveSegments: 48,
-      steps: 1,
-    });
-    applyPlaneTransformToGeometry(geo, region.plane, 0);
-    const mesh = new THREE.Mesh(
-      geo,
-      new THREE.MeshStandardMaterial({
-        color: solidRecord.color,
-        metalness: 0.15,
-        roughness: 0.7,
-      })
-    );
-    mesh.userData.solidId = solidId;
-    solidsGroup.add(mesh);
-    state.solids.push(solidRecord);
-  }
+  const colorHex = new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex();
+  const mesh = buildExtrudedMeshForRegion(region, depth, colorHex);
+  if (!mesh) return;
+  addSolidFromMesh(mesh, { color: colorHex });
 }
 
 function extrudeSelectedRegions() {
@@ -586,9 +625,23 @@ function extrudeSelectedRegions() {
     setStatus('Selected regions are no longer valid; reselect and try again.');
     return;
   }
-  for (const region of selectedRegions) {
-    extrudeRegion(region, depth);
+
+  const colorHex = new THREE.Color().setHSL(Math.random(), 0.55, 0.55).getHex();
+  const regionMeshes = selectedRegions
+    .map((region) => buildExtrudedMeshForRegion(region, depth, colorHex))
+    .filter(Boolean);
+
+  if (!regionMeshes.length) {
+    setStatus('Could not build extrusion geometry from selected regions.');
+    return;
   }
+
+  let resultMesh = regionMeshes[0];
+  for (let i = 1; i < regionMeshes.length; i++) {
+    resultMesh = CSG.union(resultMesh, regionMeshes[i]);
+  }
+  addSolidFromMesh(resultMesh, { color: colorHex });
+
   const count = selectedRegions.length;
   state.selectedRegionIds.clear();
   refreshExtrusionRegions();
@@ -597,6 +650,44 @@ function extrudeSelectedRegions() {
   document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
   const btn3d = document.querySelector('.plane-btn[data-plane="3D"]');
   if (btn3d) btn3d.classList.add('active');
+}
+
+function buildExtrudedMeshForRegion(region, depth, colorHex) {
+  if (!region || !Number.isFinite(depth) || Math.abs(depth) < 1e-6) return null;
+  const material = new THREE.MeshStandardMaterial({
+    color: colorHex,
+    metalness: 0.15,
+    roughness: 0.7,
+  });
+
+  let resultMesh = null;
+  for (const polygonRings of region.polygons) {
+    const shape = shapeFromRings(polygonRings);
+    const geo = new THREE.ExtrudeGeometry(shape, {
+      depth,
+      bevelEnabled: false,
+      curveSegments: 48,
+      steps: 1,
+    });
+    applyPlaneTransformToGeometry(geo, region.plane, 0);
+    const partMesh = new THREE.Mesh(geo, material);
+    resultMesh = resultMesh ? CSG.union(resultMesh, partMesh) : partMesh;
+  }
+  return resultMesh;
+}
+
+function addSolidFromMesh(mesh, { color }) {
+  if (!mesh?.geometry) return null;
+  const resultId = state.nextSolidId++;
+  const geometryData = geometryToData(mesh.geometry);
+  const record = {
+    id: resultId,
+    color,
+    geometryData,
+  };
+  state.solids.push(record);
+  buildSolidMesh(record);
+  return record;
 }
 
 function clearSolidsVisuals() {
@@ -720,8 +811,108 @@ function getSolidMeshById(id) {
   return solidsGroup.children.find((m) => m.userData.solidId === id) ?? null;
 }
 
+function prepareMeshForCSG(sourceMesh, { flipWinding = false } = {}) {
+  if (!sourceMesh?.geometry) return null;
+
+  const prepared = sourceMesh.clone();
+  let geo = sourceMesh.geometry.clone();
+  if (geo.index) geo = geo.toNonIndexed();
+  geo.applyMatrix4(sourceMesh.matrixWorld);
+
+  const pos = geo.getAttribute('position');
+  if (flipWinding && pos) {
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    for (let i = 0; i + 2 < pos.count; i += 3) {
+      a.fromBufferAttribute(pos, i);
+      b.fromBufferAttribute(pos, i + 1);
+      c.fromBufferAttribute(pos, i + 2);
+      pos.setXYZ(i, a.x, a.y, a.z);
+      pos.setXYZ(i + 1, c.x, c.y, c.z);
+      pos.setXYZ(i + 2, b.x, b.y, b.z);
+    }
+    pos.needsUpdate = true;
+  }
+
+  geo.deleteAttribute('normal');
+  geo.computeVertexNormals();
+
+  prepared.geometry = geo;
+  prepared.position.set(0, 0, 0);
+  prepared.rotation.set(0, 0, 0);
+  prepared.scale.set(1, 1, 1);
+  prepared.matrix.identity();
+  prepared.matrixWorld.identity();
+  prepared.updateMatrixWorld(true);
+  return prepared;
+}
+
+function meshVolume(geometry) {
+  if (!geometry) return 0;
+  const geo = geometry.index ? geometry.toNonIndexed() : geometry;
+  const pos = geo.getAttribute('position');
+  if (!pos || pos.count < 3) return 0;
+
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+  let volume = 0;
+  for (let i = 0; i + 2 < pos.count; i += 3) {
+    a.fromBufferAttribute(pos, i);
+    b.fromBufferAttribute(pos, i + 1);
+    c.fromBufferAttribute(pos, i + 2);
+    volume += a.dot(b.cross(c)) / 6;
+  }
+  return Math.abs(volume);
+}
+
+function buildPlaneFrameFromIntersection(intersection) {
+  if (!intersection?.face || !intersection.object?.geometry?.attributes?.position) return null;
+  const geometry = intersection.object.geometry;
+  const position = geometry.attributes.position;
+  const ia = intersection.face.a;
+  const ib = intersection.face.b;
+  const ic = intersection.face.c;
+  const a = new THREE.Vector3().fromBufferAttribute(position, ia).applyMatrix4(intersection.object.matrixWorld);
+  const b = new THREE.Vector3().fromBufferAttribute(position, ib).applyMatrix4(intersection.object.matrixWorld);
+  const c = new THREE.Vector3().fromBufferAttribute(position, ic).applyMatrix4(intersection.object.matrixWorld);
+
+  const normalMatrix = new THREE.Matrix3().getNormalMatrix(intersection.object.matrixWorld);
+  const ez = intersection.face.normal.clone().applyMatrix3(normalMatrix).normalize();
+  if (ez.lengthSq() < 1e-8) return null;
+
+  const edge = b.clone().sub(a);
+  edge.addScaledVector(ez, -edge.dot(ez));
+  if (edge.lengthSq() < 1e-8) {
+    edge.copy(c.clone().sub(a));
+    edge.addScaledVector(ez, -edge.dot(ez));
+  }
+  if (edge.lengthSq() < 1e-8) return null;
+
+  const ex = edge.normalize();
+  const ey = new THREE.Vector3().crossVectors(ez, ex).normalize();
+  const correctedEx = new THREE.Vector3().crossVectors(ey, ez).normalize();
+  const origin = a.clone().add(b).add(c).multiplyScalar(1 / 3);
+  return { origin, ex: correctedEx, ey, ez };
+}
+
+function enterFaceSketchPlane() {
+  if (!state.selectedFace?.planeFrame) {
+    setStatus('Select a solid face in 3D first.');
+    return false;
+  }
+  if (!state.selectedFace.workPlaneId || !resolvePlaneFrame(state.selectedFace.workPlaneId)) {
+    state.selectedFace.workPlaneId = registerCustomPlaneFromFrame(state.selectedFace.planeFrame);
+  }
+  snapCameraToPlane(state.selectedFace.workPlaneId);
+  document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
+  return true;
+}
+
 function selectSolidFromIntersection(intersection, additive = false) {
   const solidId = intersection?.object?.userData?.solidId ?? null;
+  const planeFrame = buildPlaneFrameFromIntersection(intersection);
   state.selectedSketch = null;
   if (!solidId) {
     if (!additive) {
@@ -752,6 +943,8 @@ function selectSolidFromIntersection(intersection, additive = false) {
       state.selectedFace = {
         solidId,
         faceIndex: intersection.faceIndex ?? null,
+        planeFrame,
+        workPlaneId: null,
       };
       showFaceHighlight(intersection);
     }
@@ -762,6 +955,8 @@ function selectSolidFromIntersection(intersection, additive = false) {
     state.selectedFace = {
       solidId,
       faceIndex: intersection.faceIndex ?? null,
+      planeFrame,
+      workPlaneId: null,
     };
     showFaceHighlight(intersection);
   }
@@ -793,7 +988,38 @@ function performBooleanOperation(op) {
 
   let resultMesh;
   try {
-    resultMesh = op === 'union' ? CSG.union(meshA, meshB) : CSG.subtract(meshA, meshB);
+    const preparedA = prepareMeshForCSG(meshA);
+    const preparedB = prepareMeshForCSG(meshB);
+    if (!preparedA || !preparedB) {
+      setStatus('Could not prepare selected solids for boolean.');
+      return;
+    }
+
+    resultMesh = op === 'union'
+      ? CSG.union(preparedA, preparedB)
+      : CSG.subtract(preparedA, preparedB);
+
+    if (op === 'subtract') {
+      const aVolume = meshVolume(preparedA.geometry);
+      const resultVolume = meshVolume(resultMesh?.geometry);
+      const overlapMesh = CSG.intersect(prepareMeshForCSG(meshA), prepareMeshForCSG(meshB));
+      const overlapVolume = meshVolume(overlapMesh?.geometry);
+      const overlapExists = overlapVolume > 1e-5;
+      const noMaterialRemoved = aVolume > 1e-5 && Math.abs(resultVolume - aVolume) < Math.max(aVolume * 1e-4, 1e-5);
+
+      // Some extrusions can have inverted winding; retry with flipped cutter if overlap exists but cut failed.
+      if (overlapExists && noMaterialRemoved) {
+        const retryA = prepareMeshForCSG(meshA);
+        const retryB = prepareMeshForCSG(meshB, { flipWinding: true });
+        if (retryA && retryB) {
+          const retryMesh = CSG.subtract(retryA, retryB);
+          const retryVolume = meshVolume(retryMesh?.geometry);
+          if (retryVolume < resultVolume - 1e-6) {
+            resultMesh = retryMesh;
+          }
+        }
+      }
+    }
   } catch (err) {
     setStatus(`Boolean ${op} failed`);
     return;
@@ -1146,7 +1372,7 @@ function updateSketchList() {
       label = `Polygon ${sketch.data.points.length}pts`;
     }
 
-    item.innerHTML = `${icon}<span class="shape-label">${label}</span><span class="shape-plane">${sketch.plane}</span>`;
+    item.innerHTML = `${icon}<span class="shape-label">${label}</span><span class="shape-plane">${getPlaneLabel(sketch.plane)}</span>`;
     item.addEventListener('click', () => {
       state.selectedSketch = sketch;
       state.selectedSolidIds.clear();
@@ -1306,6 +1532,9 @@ document.querySelectorAll('.tool-btn').forEach(btn => {
       state.regionCandidates = [];
       state.selectedRegionIds.clear();
     } else {
+      if (state.viewMode === '3d') {
+        if (!enterFaceSketchPlane()) return;
+      }
       document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       state.currentTool = tool;
@@ -1349,7 +1578,42 @@ document.getElementById('btn-clear').addEventListener('click', () => {
   clearFaceHighlight();
   updateSolidSelectionVisuals();
   rebuildSketchVisuals();
-  setStatus(`Cleared ${state.currentPlane} plane`);
+  setStatus(`Cleared ${getPlaneLabel(state.currentPlane)} plane`);
+});
+document.getElementById('btn-reset-all').addEventListener('click', () => {
+  const hasContent = state.sketches.length > 0 || state.solids.length > 0;
+  if (hasContent && !window.confirm('Clear all drawings and solids? This cannot be undone.')) {
+    return;
+  }
+
+  state.sketches = [];
+  state.solids = [];
+  state.selectedSketch = null;
+  state.selectedSolidIds.clear();
+  state.solidSelectionOrder = [];
+  state.selectedSolidId = null;
+  state.selectedFace = null;
+  state.customPlanes = {};
+  state.nextWorkPlaneId = 1;
+  state.currentPlane = 'XY';
+  state.regionCandidates = [];
+  state.selectedRegionIds.clear();
+  state.regionPickCycle = { key: null, index: 0 };
+  clearRegionPreviews();
+  clearFaceHighlight();
+  cancelDraw();
+  rebuildSketchVisuals();
+  rebuildSolidsVisuals();
+  if (state.viewMode === '2d') {
+    snapCameraToPlane('XY');
+    document.querySelectorAll('.plane-btn').forEach((b) => b.classList.remove('active'));
+    const xyBtn = document.querySelector('.plane-btn[data-plane="XY"]');
+    if (xyBtn) xyBtn.classList.add('active');
+  } else {
+    document.getElementById('status-plane').textContent = `Plane: ${getPlaneLabel(state.currentPlane)}`;
+  }
+  localStorage.removeItem('cad_tool_project');
+  setStatus('Reset all drawings and solids');
 });
 
 document.getElementById('btn-save').addEventListener('click', saveProject);
@@ -1358,8 +1622,10 @@ document.getElementById('btn-load').addEventListener('click', loadProject);
 document.getElementById('toggle-grid').addEventListener('change', (e) => {
   state.gridVisible = e.target.checked;
   if (state.viewMode === '2d') {
+    const activeFrame = resolvePlaneFrame(state.currentPlane);
+    const gridKey = activeFrame?.gridKey;
     Object.entries(grids).forEach(([key, g]) => {
-      g.visible = state.gridVisible && key === state.currentPlane;
+      g.visible = state.gridVisible && !!gridKey && key === gridKey;
     });
   } else {
     Object.values(grids).forEach(g => g.visible = state.gridVisible);
@@ -1408,9 +1674,11 @@ function deleteSelected() {
 // ─── Save / Load ─────────────────────────────────────────────────────
 function saveProject() {
   const data = {
-    version: 1,
+    version: 2,
     sketches: state.sketches,
     solids: state.solids,
+    customPlanes: state.customPlanes,
+    nextWorkPlaneId: state.nextWorkPlaneId,
     nextId: state.nextId,
     nextSolidId: state.nextSolidId,
   };
@@ -1434,8 +1702,11 @@ function loadProject() {
       const data = JSON.parse(stored);
       state.sketches = data.sketches || [];
       state.solids = data.solids || [];
+      state.customPlanes = data.customPlanes || {};
+      state.nextWorkPlaneId = data.nextWorkPlaneId || 1;
       state.nextId = data.nextId || 1;
       state.nextSolidId = data.nextSolidId || 1;
+      ensureCurrentPlaneValid();
       state.selectedSketch = null;
       state.selectedSolidIds.clear();
       state.solidSelectionOrder = [];
@@ -1460,8 +1731,11 @@ function loadProject() {
         const data = JSON.parse(ev.target.result);
         state.sketches = data.sketches || [];
         state.solids = data.solids || [];
+        state.customPlanes = data.customPlanes || {};
+        state.nextWorkPlaneId = data.nextWorkPlaneId || 1;
         state.nextId = data.nextId || 1;
         state.nextSolidId = data.nextSolidId || 1;
+        ensureCurrentPlaneValid();
         state.selectedSketch = null;
         state.selectedSolidIds.clear();
         state.solidSelectionOrder = [];
@@ -1482,9 +1756,11 @@ function loadProject() {
 setInterval(() => {
   if (state.sketches.length > 0 || state.solids.length > 0) {
     const data = {
-      version: 1,
+      version: 2,
       sketches: state.sketches,
       solids: state.solids,
+      customPlanes: state.customPlanes,
+      nextWorkPlaneId: state.nextWorkPlaneId,
       nextId: state.nextId,
       nextSolidId: state.nextSolidId,
     };
@@ -1541,8 +1817,11 @@ if (autoLoad) {
     const data = JSON.parse(autoLoad);
     state.sketches = data.sketches || [];
     state.solids = data.solids || [];
+    state.customPlanes = data.customPlanes || {};
+    state.nextWorkPlaneId = data.nextWorkPlaneId || 1;
     state.nextId = data.nextId || 1;
     state.nextSolidId = data.nextSolidId || 1;
+    ensureCurrentPlaneValid();
     rebuildSketchVisuals();
     rebuildSolidsVisuals();
     setStatus('Restored previous session');
